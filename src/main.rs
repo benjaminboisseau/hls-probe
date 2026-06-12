@@ -1,6 +1,7 @@
 mod analyze;
 mod fetch;
 mod live;
+mod measure;
 
 use anyhow::{bail, Result};
 use clap::Parser;
@@ -29,6 +30,14 @@ struct Args {
     #[arg(short, long)]
     all: bool,
 
+    /// Download sample segments and measure TTFB, throughput and real bitrate
+    #[arg(short, long)]
+    measure: bool,
+
+    /// Number of segments to download with --measure
+    #[arg(short = 's', long, default_value_t = 3)]
+    segments: usize,
+
     /// Emit JSON instead of human-readable text
     #[arg(short, long)]
     json: bool,
@@ -48,32 +57,69 @@ fn main() -> Result<()> {
     match playlist {
         Playlist::MasterPlaylist(master) => {
             let report = analyze::analyze_master(&master);
+            let variant_json = |v: &analyze::VariantInfo| {
+                json!({
+                    "uri": v.uri,
+                    "bandwidth": v.bandwidth,
+                    "average_bandwidth": v.average_bandwidth,
+                    "resolution": v.resolution,
+                    "codecs": v.codecs,
+                    "frame_rate": v.frame_rate,
+                    "audio_group": v.audio_group,
+                    "subtitles_group": v.subtitles_group,
+                })
+            };
+            let rendition_json = |r: &analyze::RenditionInfo| {
+                json!({
+                    "group_id": r.group_id,
+                    "name": r.name,
+                    "language": r.language,
+                    "uri": r.uri,
+                    "default": r.default,
+                    "channels": r.channels,
+                    "characteristics": r.characteristics,
+                })
+            };
             let mut out = json!({
                 "type": "master",
                 "url": fetched.final_url.as_str(),
                 "fetch_ms": fetched.elapsed.as_millis() as u64,
-                "variants": report.variants.iter().map(|v| json!({
-                    "uri": v.uri,
-                    "bandwidth": v.bandwidth,
-                    "resolution": v.resolution,
-                    "codecs": v.codecs,
-                    "frame_rate": v.frame_rate,
-                })).collect::<Vec<_>>(),
+                "variants": report.variants.iter().map(variant_json).collect::<Vec<_>>(),
+                "iframe_playlists": report.iframe_variants.iter().map(variant_json).collect::<Vec<_>>(),
+                "audio_renditions": report.audio.iter().map(rendition_json).collect::<Vec<_>>(),
+                "subtitle_renditions": report.subtitles.iter().map(rendition_json).collect::<Vec<_>>(),
                 "issues": analyze::issues_json(&report.issues),
             });
 
+            if args.live {
+                // Follow the top-bandwidth variant only.
+                if let Some(top) = report.variants.first() {
+                    let v_url = fetch::resolve(&fetched.final_url, &top.uri)?;
+                    run_media(&client, &v_url, &args)?;
+                }
+                return Ok(());
+            }
+
             let mut variant_reports = Vec::new();
-            if args.all || args.live {
+            if args.all {
                 for v in &report.variants {
                     let v_url = fetch::resolve(&fetched.final_url, &v.uri)?;
-                    if args.live {
-                        // Follow the top-bandwidth variant only.
-                        run_media(&client, &v_url, &args)?;
-                        return Ok(());
-                    }
                     let media = fetch_media(&client, &v_url)?;
                     let r = analyze::analyze_media(&media);
-                    variant_reports.push((v.uri.clone(), r));
+                    let m = if args.measure {
+                        Some(measure::measure(&client, &v_url, &media, args.segments)?)
+                    } else {
+                        None
+                    };
+                    variant_reports.push((v.uri.clone(), r, m, v.bandwidth));
+                }
+            } else if args.measure {
+                if let Some(top) = report.variants.first() {
+                    let v_url = fetch::resolve(&fetched.final_url, &top.uri)?;
+                    let media = fetch_media(&client, &v_url)?;
+                    let r = analyze::analyze_media(&media);
+                    let m = measure::measure(&client, &v_url, &media, args.segments)?;
+                    variant_reports.push((top.uri.clone(), r, Some(m), top.bandwidth));
                 }
             }
 
@@ -81,16 +127,25 @@ fn main() -> Result<()> {
                 if !variant_reports.is_empty() {
                     out["variant_reports"] = variant_reports
                         .iter()
-                        .map(|(uri, r)| media_json(uri, r))
+                        .map(|(uri, r, m, _)| {
+                            let mut v = media_json(uri, r);
+                            if let Some(m) = m {
+                                v["measure"] = measure::report_json(m);
+                            }
+                            v
+                        })
                         .collect::<Vec<_>>()
                         .into();
                 }
                 println!("{}", serde_json::to_string_pretty(&out)?);
             } else {
                 print_master(&fetched.final_url, &report);
-                for (uri, r) in &variant_reports {
+                for (uri, r, m, declared) in &variant_reports {
                     println!("\n--- variant: {uri}");
                     print_media(r);
+                    if let Some(m) = m {
+                        print_measure(m, Some(*declared));
+                    }
                 }
             }
             exit_with(&report.issues);
@@ -115,6 +170,12 @@ fn run_media(client: &reqwest::blocking::Client, url: &Url, args: &Args) -> Resu
     let media = fetch_media(client, url)?;
     let report = analyze::analyze_media(&media);
 
+    let measured = if args.measure {
+        Some(measure::measure(client, url, &media, args.segments)?)
+    } else {
+        None
+    };
+
     let live_stats = if args.live {
         if !report.is_live {
             bail!("--live requested but the playlist has EXT-X-ENDLIST (VOD)");
@@ -126,18 +187,60 @@ fn run_media(client: &reqwest::blocking::Client, url: &Url, args: &Args) -> Resu
 
     if args.json {
         let mut out = media_json(url.as_str(), &report);
+        if let Some(m) = &measured {
+            out["measure"] = measure::report_json(m);
+        }
         if let Some(stats) = &live_stats {
             out["live"] = live::stats_json(stats);
         }
         println!("{}", serde_json::to_string_pretty(&out)?);
     } else {
         print_media(&report);
+        if let Some(m) = &measured {
+            print_measure(m, None);
+        }
         if let Some(stats) = &live_stats {
             print_live(stats);
         }
     }
     exit_with(&report.issues);
     Ok(())
+}
+
+fn print_measure(m: &measure::MeasureReport, declared_bandwidth: Option<u64>) {
+    println!(
+        "measure: {} segment(s) sampled, container {}{}",
+        m.segments.len(),
+        m.container.label(),
+        if m.init_segment { " (init segment present)" } else { "" },
+    );
+    println!(
+        "  measured bitrate {:.0} kbps (peak segment {:.0} kbps), avg TTFB {:.0} ms",
+        m.measured_bitrate_bps / 1000.0,
+        m.peak_bitrate_bps / 1000.0,
+        m.avg_ttfb_ms,
+    );
+    for s in &m.segments {
+        println!(
+            "  {:>8} KiB in {:>5.0} ms (ttfb {:>4.0} ms) -> {:>6.0} kbps throughput  {}",
+            s.bytes / 1024,
+            s.total_ms,
+            s.ttfb_ms,
+            s.throughput_bps / 1000.0,
+            s.uri,
+        );
+    }
+    if let Some(declared) = declared_bandwidth {
+        // RFC 8216 §4.3.4.2: BANDWIDTH is an upper bound of the peak segment
+        // bit rate; a sampled segment exceeding it is a real conformance issue.
+        if m.peak_bitrate_bps > declared as f64 {
+            println!(
+                "  [warning] peak segment bitrate {:.0} kbps exceeds declared BANDWIDTH {:.0} kbps",
+                m.peak_bitrate_bps / 1000.0,
+                declared as f64 / 1000.0,
+            );
+        }
+    }
 }
 
 fn media_json(uri: &str, r: &analyze::MediaReport) -> serde_json::Value {
@@ -159,17 +262,64 @@ fn media_json(uri: &str, r: &analyze::MediaReport) -> serde_json::Value {
 
 fn print_master(url: &Url, r: &analyze::MasterReport) {
     println!("master playlist: {url}");
-    println!("{} variant(s):", r.variants.len());
+    println!("video variants ({}):", r.variants.len());
     for v in &r.variants {
         println!(
-            "  {:>9} bps  {:<11} {:<6} {}",
+            "  {:>9} bps{}  {:<11} {:<6} {}{}",
             v.bandwidth,
+            v.average_bandwidth
+                .map_or(String::new(), |a| format!(" (avg {a})")),
             v.resolution.as_deref().unwrap_or("?x?"),
             v.frame_rate.map_or(String::from("-"), |f| format!("{f}fps")),
             v.codecs.as_deref().unwrap_or("(no codecs)"),
+            match (&v.audio_group, &v.subtitles_group) {
+                (Some(a), Some(s)) => format!("  [audio:{a} subs:{s}]"),
+                (Some(a), None) => format!("  [audio:{a}]"),
+                (None, Some(s)) => format!("  [subs:{s}]"),
+                (None, None) => String::new(),
+            },
         );
     }
+    if !r.audio.is_empty() {
+        println!("audio renditions ({}):", r.audio.len());
+        for a in &r.audio {
+            print_rendition(a);
+        }
+    }
+    if !r.subtitles.is_empty() {
+        println!("subtitle renditions ({}):", r.subtitles.len());
+        for s in &r.subtitles {
+            print_rendition(s);
+        }
+    }
+    if !r.iframe_variants.is_empty() {
+        println!("i-frame trick-play playlists ({}):", r.iframe_variants.len());
+        for v in &r.iframe_variants {
+            println!(
+                "  {:>9} bps  {:<11} {}",
+                v.bandwidth,
+                v.resolution.as_deref().unwrap_or("?x?"),
+                v.codecs.as_deref().unwrap_or(""),
+            );
+        }
+    }
     print_issues(&r.issues);
+}
+
+fn print_rendition(a: &analyze::RenditionInfo) {
+    println!(
+        "  {:<14} {:<4} {:<20}{}{}{}",
+        a.group_id,
+        a.language.as_deref().unwrap_or("-"),
+        a.name,
+        if a.default { " DEFAULT" } else { "" },
+        a.channels
+            .as_deref()
+            .map_or(String::new(), |c| format!(" {c}ch")),
+        a.characteristics
+            .as_deref()
+            .map_or(String::new(), |c| format!(" ({c})")),
+    );
 }
 
 fn print_media(r: &analyze::MediaReport) {

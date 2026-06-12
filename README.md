@@ -4,9 +4,10 @@
 
 A small command-line probe for HLS streams. Point it at any `.m3u8` URL and it tells you what is in there and whether it is healthy:
 
-- **Variant inventory** — bandwidth, resolution, frame rate and codecs of every variant in a master playlist.
-- **Conformance checks** — segment durations exceeding `EXT-X-TARGETDURATION` (RFC 8216 §4.3.3.1), missing `CODECS`/`RESOLUTION` attributes, duplicate bandwidths, discontinuity counts, wall-clock drift between `EXT-X-PROGRAM-DATE-TIME` and summed segment durations.
-- **Live monitoring** (`--live`) — polls a live media playlist at half the target duration, counts new and stale refreshes, and estimates the playlist edge's lag behind real time from PDT tags.
+- **Full inventory** — the video ABR ladder (bandwidth, average bandwidth, resolution, frame rate, codecs, rendition groups), audio renditions (language, channels, accessibility characteristics), subtitle renditions, and i-frame trick-play playlists, each listed in its own section.
+- **Conformance checks** — segment durations exceeding `EXT-X-TARGETDURATION` (RFC 8216 §4.3.3.1), variants referencing undeclared rendition groups, missing `CODECS`/`RESOLUTION` attributes, duplicate bandwidths, discontinuity counts, wall-clock drift between `EXT-X-PROGRAM-DATE-TIME` and summed segment durations.
+- **Segment measurement** (`--measure`) — downloads sample segments and reports TTFB, download time, throughput, container format (MPEG-TS vs fMP4/CMAF, init segment detection), and the measured bitrate against the declared `BANDWIDTH` (which RFC 8216 §4.3.4.2 defines as the peak segment bit rate — exceeding it is a real conformance problem).
+- **Live monitoring** (`--live`) — polls a live media playlist at half the target duration, counts new and stale refreshes, and estimates the playlist edge's lag behind real time from PDT tags when present.
 - **JSON output** (`--json`) and a non-zero exit code on error-level findings, so it drops into monitoring scripts and CI without ceremony.
 
 Born from operating live distribution platforms (IPTV/OTT head-ends) where the first question is always: *is the origin producing a sane playlist, and how far behind live are we?*
@@ -54,15 +55,17 @@ $ hls-probe --all --json https://example.com/master.m3u8
 | `--live` | poll a live playlist and measure refresh behaviour |
 | `-n, --refreshes <N>` | number of refreshes to observe (default 10) |
 | `--all` | analyze every variant of a master playlist |
+| `--measure` | download sample segments: TTFB, throughput, real vs declared bitrate, container |
+| `-s, --segments <N>` | number of segments to sample with `--measure` (default 3) |
 | `--json` | machine-readable output |
 
 Exit codes: `0` clean or warnings only, `2` at least one error-level finding, `1` network/parse failure.
 
 ## Roadmap
 
-- Segment download checks (availability, size vs declared duration, TS/fMP4 sniffing)
-- Low-latency HLS (partial segments, preload hints)
+- Low-latency HLS (partial segments, preload hints, blocking playlist reload)
 - Multi-variant live monitoring with alignment comparison
+- Audio/subtitle rendition playlist analysis
 
 ## License
 

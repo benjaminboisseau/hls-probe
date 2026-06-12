@@ -83,12 +83,9 @@ pub fn analyze_media(pl: &MediaPlaylist) -> MediaReport {
         .iter()
         .filter(|s| s.program_date_time.is_some())
         .count();
+    // EXT-X-PROGRAM-DATE-TIME is optional; its absence only means the probe
+    // cannot estimate live-edge lag, so it is reported as a stat, not an issue.
     let has_pdt = pdt_count > 0;
-    if !has_pdt && !pl.end_list {
-        issues.push(Issue::warn(
-            "no EXT-X-PROGRAM-DATE-TIME tags: live-edge latency cannot be measured",
-        ));
-    }
 
     // Wall-clock drift: compare the PDT span against the sum of segment
     // durations between the first and last dated segments.
@@ -139,15 +136,32 @@ pub fn analyze_media(pl: &MediaPlaylist) -> MediaReport {
 
 pub struct MasterReport {
     pub variants: Vec<VariantInfo>,
+    pub iframe_variants: Vec<VariantInfo>,
+    pub audio: Vec<RenditionInfo>,
+    pub subtitles: Vec<RenditionInfo>,
     pub issues: Vec<Issue>,
 }
 
 pub struct VariantInfo {
     pub uri: String,
     pub bandwidth: u64,
+    pub average_bandwidth: Option<u64>,
     pub resolution: Option<String>,
     pub codecs: Option<String>,
     pub frame_rate: Option<f64>,
+    pub audio_group: Option<String>,
+    pub subtitles_group: Option<String>,
+}
+
+/// An EXT-X-MEDIA alternative rendition (audio track, subtitles...).
+pub struct RenditionInfo {
+    pub group_id: String,
+    pub name: String,
+    pub language: Option<String>,
+    pub uri: Option<String>,
+    pub default: bool,
+    pub channels: Option<String>,
+    pub characteristics: Option<String>,
 }
 
 pub fn analyze_master(pl: &MasterPlaylist) -> MasterReport {
@@ -157,20 +171,56 @@ pub fn analyze_master(pl: &MasterPlaylist) -> MasterReport {
         issues.push(Issue::error("master playlist declares no variant streams"));
     }
 
+    let to_info = |v: &m3u8_rs::VariantStream| VariantInfo {
+        uri: v.uri.clone(),
+        bandwidth: v.bandwidth,
+        average_bandwidth: v.average_bandwidth,
+        resolution: v.resolution.map(|r| format!("{}x{}", r.width, r.height)),
+        codecs: v.codecs.clone(),
+        frame_rate: v.frame_rate,
+        audio_group: v.audio.clone(),
+        subtitles_group: v.subtitles.clone(),
+    };
+
     let mut variants: Vec<VariantInfo> = pl
         .variants
         .iter()
-        .map(|v| VariantInfo {
-            uri: v.uri.clone(),
-            bandwidth: v.bandwidth,
-            resolution: v.resolution.map(|r| format!("{}x{}", r.width, r.height)),
-            codecs: v.codecs.clone(),
-            frame_rate: v.frame_rate,
-        })
+        .filter(|v| !v.is_i_frame)
+        .map(to_info)
         .collect();
     variants.sort_by(|a, b| b.bandwidth.cmp(&a.bandwidth));
 
-    for v in &pl.variants {
+    let mut iframe_variants: Vec<VariantInfo> = pl
+        .variants
+        .iter()
+        .filter(|v| v.is_i_frame)
+        .map(to_info)
+        .collect();
+    iframe_variants.sort_by(|a, b| b.bandwidth.cmp(&a.bandwidth));
+
+    let rendition = |a: &m3u8_rs::AlternativeMedia| RenditionInfo {
+        group_id: a.group_id.clone(),
+        name: a.name.clone(),
+        language: a.language.clone(),
+        uri: a.uri.clone(),
+        default: a.default,
+        channels: a.channels.clone(),
+        characteristics: a.characteristics.clone(),
+    };
+    let audio: Vec<RenditionInfo> = pl
+        .alternatives
+        .iter()
+        .filter(|a| a.media_type == m3u8_rs::AlternativeMediaType::Audio)
+        .map(rendition)
+        .collect();
+    let subtitles: Vec<RenditionInfo> = pl
+        .alternatives
+        .iter()
+        .filter(|a| a.media_type == m3u8_rs::AlternativeMediaType::Subtitles)
+        .map(rendition)
+        .collect();
+
+    for v in pl.variants.iter().filter(|v| !v.is_i_frame) {
         if v.codecs.is_none() {
             issues.push(Issue::warn(format!(
                 "variant '{}' has no CODECS attribute (hurts player startup decisions)",
@@ -183,10 +233,20 @@ pub fn analyze_master(pl: &MasterPlaylist) -> MasterReport {
                 v.uri
             )));
         }
+        // A variant referencing an undeclared rendition group is broken.
+        if let Some(group) = &v.audio {
+            if !audio.iter().any(|a| &a.group_id == group) {
+                issues.push(Issue::error(format!(
+                    "variant '{}' references AUDIO group '{group}' but no such \
+                     EXT-X-MEDIA group is declared",
+                    v.uri
+                )));
+            }
+        }
     }
 
     let mut seen = std::collections::HashSet::new();
-    for v in &pl.variants {
+    for v in pl.variants.iter().filter(|v| !v.is_i_frame) {
         if !seen.insert(v.bandwidth) {
             issues.push(Issue::warn(format!(
                 "duplicate BANDWIDTH value {} across variants",
@@ -195,7 +255,13 @@ pub fn analyze_master(pl: &MasterPlaylist) -> MasterReport {
         }
     }
 
-    MasterReport { variants, issues }
+    MasterReport {
+        variants,
+        iframe_variants,
+        audio,
+        subtitles,
+        issues,
+    }
 }
 
 pub fn issues_json(issues: &[Issue]) -> Value {
@@ -246,6 +312,48 @@ mod tests {
         assert!(!report.is_live);
         assert_eq!(report.segment_count, 2);
         assert!((report.total_duration - 10.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn separates_renditions_and_iframe_playlists() {
+        let src = "#EXTM3U\n#EXT-X-VERSION:6\n\
+            #EXT-X-MEDIA:TYPE=AUDIO,URI=\"audio_fr.m3u8\",GROUP-ID=\"aac\",LANGUAGE=\"fr\",NAME=\"French\",DEFAULT=YES,CHANNELS=\"2\"\n\
+            #EXT-X-MEDIA:TYPE=AUDIO,URI=\"audio_qad.m3u8\",GROUP-ID=\"aac\",LANGUAGE=\"qad\",NAME=\"Audio description\",CHARACTERISTICS=\"public.accessibility.describes-video\",CHANNELS=\"2\"\n\
+            #EXT-X-MEDIA:TYPE=SUBTITLES,URI=\"subs_fr.m3u8\",GROUP-ID=\"text\",LANGUAGE=\"fr\",NAME=\"French\",DEFAULT=YES\n\
+            #EXT-X-STREAM-INF:BANDWIDTH=5000000,AVERAGE-BANDWIDTH=4500000,CODECS=\"avc1.64002a,mp4a.40.2\",RESOLUTION=1920x1080,FRAME-RATE=50.000,AUDIO=\"aac\",SUBTITLES=\"text\"\n\
+            video_high.m3u8\n\
+            #EXT-X-STREAM-INF:BANDWIDTH=1000000,CODECS=\"avc1.4d401f,mp4a.40.2\",RESOLUTION=1024x576,AUDIO=\"aac\",SUBTITLES=\"text\"\n\
+            video_low.m3u8\n\
+            #EXT-X-I-FRAME-STREAM-INF:URI=\"video_high_iframe.m3u8\",BANDWIDTH=700000,CODECS=\"avc1.64002a\",RESOLUTION=1920x1080\n";
+        let master = match m3u8_rs::parse_playlist_res(src.as_bytes()).expect("parse") {
+            m3u8_rs::Playlist::MasterPlaylist(p) => p,
+            _ => panic!("expected master playlist"),
+        };
+        let report = analyze_master(&master);
+        assert_eq!(report.variants.len(), 2);
+        assert_eq!(report.iframe_variants.len(), 1);
+        assert_eq!(report.audio.len(), 2);
+        assert_eq!(report.subtitles.len(), 1);
+        assert_eq!(report.variants[0].average_bandwidth, Some(4_500_000));
+        assert_eq!(report.audio[1].language.as_deref(), Some("qad"));
+        // i-frame playlists must not trigger missing-RESOLUTION style warnings
+        assert!(report.issues.is_empty());
+    }
+
+    #[test]
+    fn flags_variant_referencing_unknown_audio_group() {
+        let src = "#EXTM3U\n\
+            #EXT-X-STREAM-INF:BANDWIDTH=1000000,CODECS=\"avc1.4d401f,mp4a.40.2\",RESOLUTION=1024x576,AUDIO=\"missing\"\n\
+            video.m3u8\n";
+        let master = match m3u8_rs::parse_playlist_res(src.as_bytes()).expect("parse") {
+            m3u8_rs::Playlist::MasterPlaylist(p) => p,
+            _ => panic!("expected master playlist"),
+        };
+        let report = analyze_master(&master);
+        assert!(report
+            .issues
+            .iter()
+            .any(|i| i.severity == Severity::Error && i.message.contains("AUDIO group")));
     }
 
     #[test]
