@@ -8,6 +8,7 @@ A small command-line probe for HLS streams. Point it at any `.m3u8` URL and it t
 - **Conformance checks** — segment durations exceeding `EXT-X-TARGETDURATION` (RFC 8216 §4.3.3.1), variants referencing undeclared rendition groups, missing `CODECS`/`RESOLUTION` attributes, duplicate bandwidths, discontinuity counts, wall-clock drift between `EXT-X-PROGRAM-DATE-TIME` and summed segment durations.
 - **Segment measurement** (`--measure`) — downloads sample segments and reports TTFB, download time, throughput, container format (MPEG-TS vs fMP4/CMAF, init segment detection), and the measured bitrate against the declared `BANDWIDTH` (which RFC 8216 §4.3.4.2 defines as the peak segment bit rate — exceeding it is a real conformance problem).
 - **Live monitoring** (`--live`) — polls a live media playlist at half the target duration, counts new and stale refreshes, and estimates the playlist edge's lag behind real time from PDT tags when present.
+- **CDN edge test** (`--edge-test`) — measures the cache-miss penalty the first viewer per edge node pays on every newly published segment: fetches each new segment immediately, then the same URL one target duration later, and compares TTFB. Reads CDN cache-decision headers (`X-Cache`, `Age`, `cf-cache-status`...) to prove the miss/hit, including Akamai's debug Pragma.
 - **JSON output** (`--json`) and a non-zero exit code on error-level findings, so it drops into monitoring scripts and CI without ceremony.
 
 Born from operating live distribution platforms (IPTV/OTT head-ends) where the first question is always: *is the origin producing a sane playlist, and how far behind live are we?*
@@ -57,6 +58,8 @@ $ hls-probe --all --json https://example.com/master.m3u8
 | `--all` | analyze every variant of a master playlist |
 | `--measure` | download sample segments: TTFB, throughput, real vs declared bitrate, container |
 | `-s, --segments <N>` | number of segments to sample with `--measure` (default 3) |
+| `--edge-test` | measure the CDN cache-miss penalty on freshly published segments |
+| `-p, --pairs <N>` | number of fresh/warmed pairs to collect with `--edge-test` (default 5) |
 | `--json` | machine-readable output |
 
 Exit codes: `0` clean or warnings only, `2` at least one error-level finding, `1` network/parse failure.

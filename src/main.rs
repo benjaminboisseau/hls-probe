@@ -1,4 +1,5 @@
 mod analyze;
+mod edge;
 mod fetch;
 mod live;
 mod measure;
@@ -37,6 +38,15 @@ struct Args {
     /// Number of segments to download with --measure
     #[arg(short = 's', long, default_value_t = 3)]
     segments: usize,
+
+    /// Measure the CDN cache-miss penalty at the live edge: fetch each newly
+    /// published segment immediately, then again one target duration later
+    #[arg(short, long)]
+    edge_test: bool,
+
+    /// Number of fresh/warmed pairs to collect with --edge-test
+    #[arg(short, long, default_value_t = 5)]
+    pairs: usize,
 
     /// Emit JSON instead of human-readable text
     #[arg(short, long)]
@@ -91,7 +101,7 @@ fn main() -> Result<()> {
                 "issues": analyze::issues_json(&report.issues),
             });
 
-            if args.live {
+            if args.live || args.edge_test {
                 // Follow the top-bandwidth variant only.
                 if let Some(top) = report.variants.first() {
                     let v_url = fetch::resolve(&fetched.final_url, &top.uri)?;
@@ -185,6 +195,15 @@ fn run_media(client: &reqwest::blocking::Client, url: &Url, args: &Args) -> Resu
         None
     };
 
+    let edge_report = if args.edge_test {
+        if !report.is_live {
+            bail!("--edge-test requested but the playlist has EXT-X-ENDLIST (VOD)");
+        }
+        Some(edge::edge_test(client, url, args.pairs, args.json)?)
+    } else {
+        None
+    };
+
     if args.json {
         let mut out = media_json(url.as_str(), &report);
         if let Some(m) = &measured {
@@ -192,6 +211,9 @@ fn run_media(client: &reqwest::blocking::Client, url: &Url, args: &Args) -> Resu
         }
         if let Some(stats) = &live_stats {
             out["live"] = live::stats_json(stats);
+        }
+        if let Some(e) = &edge_report {
+            out["edge_test"] = edge::report_json(e);
         }
         println!("{}", serde_json::to_string_pretty(&out)?);
     } else {
@@ -202,9 +224,36 @@ fn run_media(client: &reqwest::blocking::Client, url: &Url, args: &Args) -> Resu
         if let Some(stats) = &live_stats {
             print_live(stats);
         }
+        if let Some(e) = &edge_report {
+            print_edge(e);
+        }
     }
     exit_with(&report.issues);
     Ok(())
+}
+
+fn print_edge(r: &edge::EdgeReport) {
+    println!(
+        "edge test: {} fresh/warmed pair(s) (fresh = first request after publication, \
+         warmed = same segment one target duration later)",
+        r.pairs.len(),
+    );
+    for p in &r.pairs {
+        println!(
+            "  fresh {:>5.0} ms{}  warmed {:>5.0} ms{}  penalty {:+5.0} ms  {}",
+            p.fresh.ttfb_ms,
+            edge::cache_label(&p.fresh),
+            p.warmed.ttfb_ms,
+            edge::cache_label(&p.warmed),
+            p.penalty_ms(),
+            p.uri,
+        );
+    }
+    println!(
+        "  avg: fresh TTFB {:.0} ms, warmed {:.0} ms, penalty {:+.0} ms",
+        r.avg_fresh_ttfb, r.avg_warmed_ttfb, r.avg_penalty_ms,
+    );
+    println!("  reading: {}", r.verdict());
 }
 
 fn print_measure(m: &measure::MeasureReport, declared_bandwidth: Option<u64>) {
