@@ -1,0 +1,23 @@
+[package]
+name = "hls-probe"
+version = "0.1.0"
+edition = "2021"
+authors = ["Benjamin Boisseau <bboisseau@tuta.com>"]
+description = "CLI probe for HLS streams: variant inventory, conformance checks, live-edge latency estimation"
+license = "MIT"
+repository = "https://github.com/benjaminboisseau/hls-probe"
+keywords = ["hls", "streaming", "m3u8", "broadcast", "monitoring"]
+categories = ["command-line-utilities", "multimedia"]
+
+[dependencies]
+anyhow = "1"
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
+m3u8-rs = "6"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+serde_json = "1"
+url = "2"
+
+[profile.release]
+strip = true
+lto = true
