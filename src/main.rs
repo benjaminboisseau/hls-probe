@@ -265,10 +265,10 @@ fn print_master(url: &Url, r: &analyze::MasterReport) {
     println!("video variants ({}):", r.variants.len());
     for v in &r.variants {
         println!(
-            "  {:>9} bps{}  {:<11} {:<6} {}{}",
-            v.bandwidth,
+            "  {:>7} kbps{}  {:<11} {:<6} {}{}",
+            v.bandwidth / 1000,
             v.average_bandwidth
-                .map_or(String::new(), |a| format!(" (avg {a})")),
+                .map_or(String::new(), |a| format!(" (avg {})", a / 1000)),
             v.resolution.as_deref().unwrap_or("?x?"),
             v.frame_rate.map_or(String::from("-"), |f| format!("{f}fps")),
             v.codecs.as_deref().unwrap_or("(no codecs)"),
@@ -296,8 +296,8 @@ fn print_master(url: &Url, r: &analyze::MasterReport) {
         println!("i-frame trick-play playlists ({}):", r.iframe_variants.len());
         for v in &r.iframe_variants {
             println!(
-                "  {:>9} bps  {:<11} {}",
-                v.bandwidth,
+                "  {:>7} kbps  {:<11} {}",
+                v.bandwidth / 1000,
                 v.resolution.as_deref().unwrap_or("?x?"),
                 v.codecs.as_deref().unwrap_or(""),
             );
