@@ -71,6 +71,63 @@ pub struct SegmentMeasure {
     pub bitrate_bps: f64,
 }
 
+/// Cache-relevant response headers observed on the sampled segments.
+///
+/// CDNs disagree on what an origin must send before they will cache large
+/// objects. Google Cloud CDN only performs chunked cache fill (required for
+/// objects over 1 MiB, and for anything over 10 MiB at all) when the origin
+/// answers with `Accept-Ranges: bytes`, `Content-Length`, *and* both
+/// `Last-Modified` and a strong `ETag`. Google Media CDN refuses to cache
+/// objects over 1 MiB without a validator and byte-range support. CloudFront
+/// needs none of this and caches on `Cache-Control` alone — which is why an
+/// origin that looks healthy behind CloudFront can stop caching behind GCP.
+#[derive(Debug, Default, Clone)]
+pub struct OriginCacheability {
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    pub cache_control: Option<String>,
+    pub accept_ranges_bytes: bool,
+    /// Largest single sampled segment, to compare against the 1 MiB rule.
+    pub largest_segment_bytes: u64,
+}
+
+impl OriginCacheability {
+    pub fn etag_is_strong(&self) -> bool {
+        self.etag.as_deref().is_some_and(|v| !v.starts_with("W/"))
+    }
+
+    pub fn has_validator(&self) -> bool {
+        self.etag.is_some() || self.last_modified.is_some()
+    }
+
+    /// Would Google Cloud CDN treat this origin as supporting byte ranges?
+    pub fn gcp_range_capable(&self) -> bool {
+        self.accept_ranges_bytes && self.etag_is_strong() && self.last_modified.is_some()
+    }
+
+    pub fn warnings(&self) -> Vec<String> {
+        let mut w = Vec::new();
+        let over_1mib = self.largest_segment_bytes > 1_048_576;
+        if over_1mib && !self.has_validator() {
+            w.push(format!(
+                "segments up to {} KiB carry no ETag or Last-Modified: Google Media CDN will not cache objects over 1 MiB without a validator",
+                self.largest_segment_bytes / 1024
+            ));
+        }
+        if over_1mib && !self.gcp_range_capable() {
+            w.push(
+                "origin fails Google Cloud CDN's byte-range test (needs Accept-Ranges: bytes + strong ETag + Last-Modified): no chunked cache fill, cacheable size capped at 10 MiB".to_string(),
+            );
+        }
+        if self.cache_control.is_none() {
+            w.push(
+                "no Cache-Control on segments: CDNs in honor-origin mode will not cache them at all".to_string(),
+            );
+        }
+        w
+    }
+}
+
 pub struct MeasureReport {
     pub container: Container,
     pub init_segment: bool,
@@ -80,6 +137,7 @@ pub struct MeasureReport {
     /// Highest single-segment bitrate seen.
     pub peak_bitrate_bps: f64,
     pub avg_ttfb_ms: f64,
+    pub cacheability: OriginCacheability,
 }
 
 /// Download the `count` newest segments of a media playlist and measure them.
@@ -119,6 +177,7 @@ pub fn measure(
     }
 
     let mut segments = Vec::with_capacity(take);
+    let mut cacheability = OriginCacheability::default();
     for (seg, range) in newest.iter().zip(newest_ranges.iter()) {
         let seg_url = fetch::resolve(playlist_url, &seg.uri)?;
         let mut req = client.get(seg_url.as_str());
@@ -128,6 +187,21 @@ pub fn measure(
         let start = Instant::now();
         let resp = req.send()?.error_for_status()?;
         let ttfb = start.elapsed();
+
+        let header = |name: &str| {
+            resp.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        cacheability.etag = header("etag").or(cacheability.etag.take());
+        cacheability.last_modified = header("last-modified").or(cacheability.last_modified.take());
+        cacheability.cache_control = header("cache-control").or(cacheability.cache_control.take());
+        // A 206 answer to our own Range request proves range support even if
+        // the origin omits Accept-Ranges on partial responses.
+        cacheability.accept_ranges_bytes |= header("accept-ranges").as_deref() == Some("bytes")
+            || resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+
         let body = resp.bytes()?;
         let total = start.elapsed();
 
@@ -136,6 +210,7 @@ pub fn measure(
         }
 
         let bytes = body.len() as u64;
+        cacheability.largest_segment_bytes = cacheability.largest_segment_bytes.max(bytes);
         let duration = seg.duration as f64;
         segments.push(SegmentMeasure {
             uri: seg.uri.clone(),
@@ -165,6 +240,7 @@ pub fn measure(
         measured_bitrate_bps: measured,
         peak_bitrate_bps: peak,
         avg_ttfb_ms: avg_ttfb,
+        cacheability,
     })
 }
 
@@ -176,6 +252,16 @@ pub fn report_json(r: &MeasureReport) -> Value {
         "measured_bitrate_bps": r.measured_bitrate_bps as u64,
         "peak_segment_bitrate_bps": r.peak_bitrate_bps as u64,
         "avg_ttfb_ms": r.avg_ttfb_ms,
+        "origin_cacheability": {
+            "etag": r.cacheability.etag,
+            "etag_strong": r.cacheability.etag_is_strong(),
+            "last_modified": r.cacheability.last_modified,
+            "cache_control": r.cacheability.cache_control,
+            "accept_ranges_bytes": r.cacheability.accept_ranges_bytes,
+            "largest_segment_bytes": r.cacheability.largest_segment_bytes,
+            "gcp_cloud_cdn_range_capable": r.cacheability.gcp_range_capable(),
+            "warnings": r.cacheability.warnings(),
+        },
         "segments": r.segments.iter().map(|s| json!({
             "uri": s.uri,
             "bytes": s.bytes,
@@ -245,5 +331,58 @@ mod tests {
     fn segments_without_byte_range_pass_through() {
         let segments = vec![seg("a.ts", None), seg("b.ts", None)];
         assert_eq!(resolve_byte_ranges(&segments), vec![None, None]);
+    }
+
+    #[test]
+    fn weak_etag_is_not_strong() {
+        let c = OriginCacheability {
+            etag: Some("W/\"abc\"".to_string()),
+            ..Default::default()
+        };
+        assert!(!c.etag_is_strong());
+        assert!(c.has_validator());
+    }
+
+    #[test]
+    fn gcp_range_capability_needs_all_three() {
+        let full = OriginCacheability {
+            etag: Some("\"abc\"".to_string()),
+            last_modified: Some("Mon, 01 Jun 2026 00:00:00 GMT".to_string()),
+            accept_ranges_bytes: true,
+            ..Default::default()
+        };
+        assert!(full.gcp_range_capable());
+        for missing in [
+            OriginCacheability { etag: None, ..full.clone() },
+            OriginCacheability { last_modified: None, ..full.clone() },
+            OriginCacheability { accept_ranges_bytes: false, ..full.clone() },
+            OriginCacheability { etag: Some("W/\"abc\"".to_string()), ..full.clone() },
+        ] {
+            assert!(!missing.gcp_range_capable());
+        }
+    }
+
+    #[test]
+    fn large_segments_without_validator_warn() {
+        let c = OriginCacheability {
+            cache_control: Some("max-age=1209600".to_string()),
+            largest_segment_bytes: 3 * 1_048_576,
+            ..Default::default()
+        };
+        let warnings = c.warnings();
+        assert!(warnings.iter().any(|w| w.contains("Media CDN")));
+        assert!(warnings.iter().any(|w| w.contains("Cloud CDN")));
+    }
+
+    #[test]
+    fn small_segments_with_validator_are_quiet() {
+        let c = OriginCacheability {
+            etag: Some("\"abc\"".to_string()),
+            last_modified: Some("Mon, 01 Jun 2026 00:00:00 GMT".to_string()),
+            cache_control: Some("max-age=14".to_string()),
+            accept_ranges_bytes: true,
+            largest_segment_bytes: 500_000,
+        };
+        assert!(c.warnings().is_empty());
     }
 }

@@ -290,6 +290,19 @@ fn print_measure(m: &measure::MeasureReport, declared_bandwidth: Option<u64>) {
             );
         }
     }
+    let c = &m.cacheability;
+    let show = |v: &Option<String>| v.clone().unwrap_or_else(|| "absent".to_string());
+    println!(
+        "  origin headers: ETag {}{}, Last-Modified {}, Accept-Ranges {}, Cache-Control {}",
+        show(&c.etag),
+        if c.etag.is_some() && !c.etag_is_strong() { " (weak)" } else { "" },
+        show(&c.last_modified),
+        if c.accept_ranges_bytes { "bytes" } else { "absent" },
+        show(&c.cache_control),
+    );
+    for w in c.warnings() {
+        println!("  [warning] {w}");
+    }
 }
 
 fn media_json(uri: &str, r: &analyze::MediaReport) -> serde_json::Value {
