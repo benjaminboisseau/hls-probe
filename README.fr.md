@@ -53,6 +53,9 @@ live: 10 refreshes over 14s, 5 new segment(s), 0 stale refresh(es)
 | `--edge-test` | mesure la pénalité de cache-miss CDN sur les segments fraîchement publiés |
 | `-p, --pairs <N>` | nombre de paires fresh/warmed à collecter avec `--edge-test` (5 par défaut) |
 | `--json` | sortie machine |
+| `-H, --header <NOM: VALEUR>` | ajoute un en-tête à chaque requête, à la curl (répétable) |
+
+Les en-têtes personnalisés s'appliquent aux requêtes de playlists comme de segments — utile pour les origines protégées par jeton (`-H "Authorization: Bearer ..."`), pour atteindre une origine directement derrière un virtual host (`-H "Host: origin.example"`), ou pour voir ce qu'un vrai lecteur recevrait (`-H "User-Agent: AppleCoreMedia/..."`). Un `User-Agent` fourni remplace le `hls-probe/<version>` par défaut.
 
 Codes de sortie : `0` sain ou avertissements seulement, `2` au moins une erreur de conformité, `1` échec réseau/parsing.
 

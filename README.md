@@ -62,6 +62,9 @@ $ hls-probe --all --json https://example.com/master.m3u8
 | `--edge-test` | measure the CDN cache-miss penalty on freshly published segments |
 | `-p, --pairs <N>` | number of fresh/warmed pairs to collect with `--edge-test` (default 5) |
 | `--json` | machine-readable output |
+| `-H, --header <NAME: VALUE>` | add a request header to every request, curl style (repeatable) |
+
+Custom headers apply to playlist and segment requests alike — handy for token-protected origins (`-H "Authorization: Bearer ..."`), for reaching an origin directly behind a virtual host (`-H "Host: origin.example"`), or for seeing what a real player would get (`-H "User-Agent: AppleCoreMedia/..."`). A user-supplied `User-Agent` replaces the default `hls-probe/<version>`.
 
 Exit codes: `0` clean or warnings only, `2` at least one error-level finding, `1` network/parse failure.
 

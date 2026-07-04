@@ -51,12 +51,17 @@ struct Args {
     /// Emit JSON instead of human-readable text
     #[arg(short, long)]
     json: bool,
+
+    /// Add a request header to every request, curl style (repeatable).
+    /// Example: -H "Authorization: Bearer TOKEN" -H "X-Forwarded-For: 1.2.3.4"
+    #[arg(short = 'H', long = "header", value_name = "NAME: VALUE")]
+    headers: Vec<String>,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
     let url = Url::parse(&args.url)?;
-    let client = fetch::client()?;
+    let client = fetch::client(&args.headers)?;
 
     let fetched = fetch::fetch(&client, &url)?;
     let playlist = match m3u8_rs::parse_playlist_res(&fetched.bytes) {
