@@ -178,8 +178,10 @@ pub fn measure(
 
     let mut segments = Vec::with_capacity(take);
     let mut cacheability = OriginCacheability::default();
+    let mut warmed_hosts = Vec::new();
     for (seg, range) in newest.iter().zip(newest_ranges.iter()) {
         let seg_url = fetch::resolve(playlist_url, &seg.uri)?;
+        fetch::warm_connection(client, &seg_url, &mut warmed_hosts);
         let mut req = client.get(seg_url.as_str());
         if let Some((offset, length)) = range {
             req = req.header(RANGE, format!("bytes={}-{}", offset, offset + length - 1));
@@ -244,7 +246,35 @@ pub fn measure(
     })
 }
 
-pub fn report_json(r: &MeasureReport) -> Value {
+/// RFC 8216 §4.3.4.2: BANDWIDTH is an upper bound of the peak segment bit
+/// rate, so one sampled segment above it is already a conformance issue.
+pub fn bandwidth_warning(r: &MeasureReport, declared_bps: u64) -> Option<String> {
+    (r.peak_bitrate_bps > declared_bps as f64).then(|| {
+        format!(
+            "peak segment bitrate {:.0} kbps exceeds declared BANDWIDTH {:.0} kbps",
+            r.peak_bitrate_bps / 1000.0,
+            declared_bps as f64 / 1000.0,
+        )
+    })
+}
+
+/// `declared_bps` is the variant's BANDWIDTH when the probe came in through
+/// a master playlist (a bare media playlist has nothing to compare against).
+pub fn report_json(r: &MeasureReport, declared_bps: Option<u64>) -> Value {
+    let mut v = report_json_base(r);
+    if let Some(declared) = declared_bps {
+        let warning = bandwidth_warning(r, declared);
+        v["bandwidth_check"] = json!({
+            "declared_bandwidth_bps": declared,
+            "peak_segment_bitrate_bps": r.peak_bitrate_bps as u64,
+            "exceeded": warning.is_some(),
+            "warning": warning,
+        });
+    }
+    v
+}
+
+fn report_json_base(r: &MeasureReport) -> Value {
     json!({
         "container": r.container.label(),
         "init_segment": r.init_segment,
@@ -372,6 +402,30 @@ mod tests {
         let warnings = c.warnings();
         assert!(warnings.iter().any(|w| w.contains("Media CDN")));
         assert!(warnings.iter().any(|w| w.contains("Cloud CDN")));
+    }
+
+    fn report_with_peak(peak_bps: f64) -> MeasureReport {
+        MeasureReport {
+            container: Container::MpegTs,
+            init_segment: false,
+            segments: Vec::new(),
+            measured_bitrate_bps: peak_bps,
+            peak_bitrate_bps: peak_bps,
+            avg_ttfb_ms: 0.0,
+            cacheability: OriginCacheability::default(),
+        }
+    }
+
+    #[test]
+    fn bandwidth_overshoot_reaches_json_too() {
+        let r = report_with_peak(5_400_000.0);
+        assert!(bandwidth_warning(&r, 5_000_000).unwrap().contains("exceeds"));
+        assert!(bandwidth_warning(&r, 6_000_000).is_none());
+        let v = report_json(&r, Some(5_000_000));
+        assert_eq!(v["bandwidth_check"]["exceeded"], true);
+        assert_eq!(v["bandwidth_check"]["declared_bandwidth_bps"], 5_000_000);
+        // No master playlist, no declared value: the block is simply absent.
+        assert!(report_json(&r, None).get("bandwidth_check").is_none());
     }
 
     #[test]

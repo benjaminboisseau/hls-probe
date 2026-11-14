@@ -8,9 +8,9 @@ Une petite sonde en ligne de commande pour flux HLS. Donnez-lui n'importe quelle
 - **Contrôles de conformité** — durées de segment dépassant `EXT-X-TARGETDURATION` (RFC 8216 §4.3.3.1), variantes référençant un groupe de renditions non déclaré, attributs `CODECS`/`RESOLUTION` manquants, bandes passantes en double, comptage des discontinuités, dérive entre `EXT-X-PROGRAM-DATE-TIME` et la somme des durées de segments.
 - **Mesure des segments** (`--measure`) — télécharge des segments et rapporte TTFB, temps de téléchargement, débit, format conteneur (MPEG-TS vs fMP4/CMAF, détection du segment d'init) et le débit mesuré face au `BANDWIDTH` déclaré (que la RFC 8216 §4.3.4.2 définit comme le débit crête par segment : le dépasser est un vrai problème de conformité).
 - **Audit de cachabilité de l'origine** (inclus dans `--measure`) — rapporte les en-têtes de cache réellement portés par les segments (`ETag` fort/faible, `Last-Modified`, `Accept-Ranges`, `Cache-Control`) et avertit quand ils feront mal sur un vrai CDN : Google Media CDN refuse de mettre en cache les objets de plus de 1 Mio sans validateur, et Google Cloud CDN ne fait de remplissage de cache par blocs que si l'origine envoie `Accept-Ranges: bytes` plus un `ETag` fort *et* un `Last-Modified`. Les origines conçues pour CloudFront (qui met en cache sur le seul `Cache-Control`) échouent couramment à ce test.
-- **Monitoring live** (`--live`) — interroge une media playlist live à la moitié de la target duration, compte les rafraîchissements avec et sans progression, et estime le retard du bord de playlist par rapport au temps réel via les tags PDT lorsqu'ils sont présents.
-- **Test du edge CDN** (`--edge-test`) — mesure la pénalité de cache-miss que paie le premier spectateur par nœud edge sur chaque segment fraîchement publié : requête immédiate du nouveau segment, puis la même URL une target duration plus tard, et comparaison des TTFB. Lit les en-têtes de décision de cache du CDN (`X-Cache`, `Age`, `cf-cache-status`...) pour prouver le miss/hit, y compris le Pragma de debug Akamai.
-- **Sortie JSON** (`--json`) et code de sortie non nul en cas d'erreur de conformité : l'outil s'intègre directement dans des scripts de monitoring ou une CI.
+- **Monitoring live** (`--live`) — interroge une media playlist live à la moitié de la target duration, rapporte la plus longue durée sans publication de segment (avertissement au-delà de 1,5 target duration), signale un bord de playlist qui recule (une copie plus ancienne servie après une plus récente), et estime le retard du bord de playlist par rapport au temps réel via les tags PDT lorsqu'ils sont présents.
+- **Test du edge CDN** (`--edge-test`) — mesure la pénalité de cache-miss que paie le premier spectateur par nœud edge sur chaque segment fraîchement publié : requête immédiate du nouveau segment, puis la même URL une target duration plus tard, et comparaison des TTFB. Quand le CDN annonce sa décision de cache (`Cache-Status` de la RFC 9211, `X-Cache`, `cf-cache-status`, Pragma de debug Akamai), le verdict s'appuie sur cette déclaration plutôt que sur le chronométrage : pénalité miss-puis-hit confirmée, edge déjà chaud, ou — celui qui mérite une alerte — des segments qui manquent le cache à la seconde requête aussi, donc rien n'est mis en cache.
+- **Sortie JSON** (`--json`) et code de sortie non nul en cas d'erreur de conformité — dans la master playlist ou dans n'importe quelle variante analysée avec `--all` : l'outil s'intègre directement dans des scripts de monitoring ou une CI.
 
 Né de l'exploitation de plateformes de distribution live (têtes de réseau IPTV/OTT) où la première question est toujours : *l'origine produit-elle une playlist saine, et à quelle distance du direct sommes-nous ?*
 
@@ -20,7 +20,7 @@ Né de l'exploitation de plateformes de distribution live (têtes de réseau IPT
 cargo install --git https://github.com/benjaminboisseau/hls-probe
 ```
 
-Ou clonez puis `cargo build --release` ; le binaire se trouve dans `target/release/hls-probe`.
+Ou clonez puis `cargo build --release` ; le binaire se trouve dans `target/release/hls-probe`. Des binaires précompilés pour Linux, macOS et Windows accompagnent chaque [release](https://github.com/benjaminboisseau/hls-probe/releases).
 
 ## Utilisation
 
@@ -39,7 +39,7 @@ Suivre l'avancement d'un flux live (suit la variante de plus haut débit) :
 
 ```
 $ hls-probe --live -n 10 https://example.com/live/master.m3u8
-live: 10 refreshes over 14s, 5 new segment(s), 0 stale refresh(es)
+live: 10 refreshes over 14s, 5 new segment(s), longest stall 4.0s (5 of 10 refreshes unchanged, at most 1 in a row)
   edge lag: avg 11.7s, min 9.4s, max 14.1s (PDT-based)
 ```
 
@@ -54,6 +54,7 @@ live: 10 refreshes over 14s, 5 new segment(s), 0 stale refresh(es)
 | `-p, --pairs <N>` | nombre de paires fresh/warmed à collecter avec `--edge-test` (5 par défaut) |
 | `--json` | sortie machine |
 | `-H, --header <NOM: VALEUR>` | ajoute un en-tête à chaque requête, à la curl (répétable) |
+| `-t, --timeout <SECONDES>` | abandonne une requête après ce délai, corps compris (30 par défaut) |
 
 Les en-têtes personnalisés s'appliquent aux requêtes de playlists comme de segments — utile pour les origines protégées par jeton (`-H "Authorization: Bearer ..."`), pour atteindre une origine directement derrière un virtual host (`-H "Host: origin.example"`), ou pour voir ce qu'un vrai lecteur recevrait (`-H "User-Agent: AppleCoreMedia/..."`). Un `User-Agent` fourni remplace le `hls-probe/<version>` par défaut.
 

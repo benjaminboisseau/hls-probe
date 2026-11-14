@@ -42,6 +42,36 @@ pub struct MediaReport {
     pub issues: Vec<Issue>,
 }
 
+/// Parse a playlist, first rewriting EXT-X-PROGRAM-DATE-TIME offsets written
+/// without a colon (`+0000`, as ffmpeg emits) into the `+00:00` form the
+/// parser requires. Both are valid ISO 8601, which is what RFC 8216 asks for;
+/// without this, such streams would silently read as having no PDT at all.
+pub fn parse_playlist(bytes: &[u8]) -> Result<m3u8_rs::Playlist, String> {
+    const TAG: &str = "#EXT-X-PROGRAM-DATE-TIME:";
+    let text = String::from_utf8_lossy(bytes);
+    let fixed: String = if text.contains(TAG) {
+        text.lines()
+            .map(|line| {
+                let l = line.trim_end();
+                let b = l.as_bytes();
+                let n = b.len();
+                let basic_offset = l.starts_with(TAG)
+                    && n >= 5
+                    && (b[n - 5] == b'+' || b[n - 5] == b'-')
+                    && b[n - 4..].iter().all(u8::is_ascii_digit);
+                if basic_offset {
+                    format!("{}:{}\n", &l[..n - 2], &l[n - 2..])
+                } else {
+                    format!("{line}\n")
+                }
+            })
+            .collect()
+    } else {
+        text.into_owned()
+    };
+    m3u8_rs::parse_playlist_res(fixed.as_bytes()).map_err(|e| e.to_string())
+}
+
 /// Run RFC 8216 sanity checks on a media playlist.
 pub fn analyze_media(pl: &MediaPlaylist) -> MediaReport {
     let mut issues = Vec::new();
@@ -188,7 +218,7 @@ pub fn analyze_master(pl: &MasterPlaylist) -> MasterReport {
         .filter(|v| !v.is_i_frame)
         .map(to_info)
         .collect();
-    variants.sort_by(|a, b| b.bandwidth.cmp(&a.bandwidth));
+    variants.sort_by_key(|v| std::cmp::Reverse(v.bandwidth));
 
     let mut iframe_variants: Vec<VariantInfo> = pl
         .variants
@@ -196,7 +226,7 @@ pub fn analyze_master(pl: &MasterPlaylist) -> MasterReport {
         .filter(|v| v.is_i_frame)
         .map(to_info)
         .collect();
-    iframe_variants.sort_by(|a, b| b.bandwidth.cmp(&a.bandwidth));
+    iframe_variants.sort_by_key(|v| std::cmp::Reverse(v.bandwidth));
 
     let rendition = |a: &m3u8_rs::AlternativeMedia| RenditionInfo {
         group_id: a.group_id.clone(),
@@ -238,6 +268,15 @@ pub fn analyze_master(pl: &MasterPlaylist) -> MasterReport {
             if !audio.iter().any(|a| &a.group_id == group) {
                 issues.push(Issue::error(format!(
                     "variant '{}' references AUDIO group '{group}' but no such \
+                     EXT-X-MEDIA group is declared",
+                    v.uri
+                )));
+            }
+        }
+        if let Some(group) = &v.subtitles {
+            if !subtitles.iter().any(|s| &s.group_id == group) {
+                issues.push(Issue::error(format!(
+                    "variant '{}' references SUBTITLES group '{group}' but no such \
                      EXT-X-MEDIA group is declared",
                     v.uri
                 )));
@@ -354,6 +393,42 @@ mod tests {
             .issues
             .iter()
             .any(|i| i.severity == Severity::Error && i.message.contains("AUDIO group")));
+    }
+
+    #[test]
+    fn flags_variant_referencing_unknown_subtitles_group() {
+        let src = "#EXTM3U\n\
+            #EXT-X-STREAM-INF:BANDWIDTH=1000000,CODECS=\"avc1.4d401f,mp4a.40.2\",RESOLUTION=1024x576,SUBTITLES=\"missing\"\n\
+            video.m3u8\n";
+        let master = match m3u8_rs::parse_playlist_res(src.as_bytes()).expect("parse") {
+            m3u8_rs::Playlist::MasterPlaylist(p) => p,
+            _ => panic!("expected master playlist"),
+        };
+        let report = analyze_master(&master);
+        assert!(report
+            .issues
+            .iter()
+            .any(|i| i.severity == Severity::Error && i.message.contains("SUBTITLES group")));
+    }
+
+    #[test]
+    fn reads_program_date_time_with_colonless_offset() {
+        // ffmpeg writes "+0000"; the dated and the plain forms must agree.
+        let mk = |pdt: &str| {
+            format!(
+                "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n\
+                 #EXT-X-PROGRAM-DATE-TIME:{pdt}\n#EXTINF:2.0,\nseg0.ts\n"
+            )
+        };
+        let read = |src: String| match parse_playlist(src.as_bytes()).expect("parse") {
+            m3u8_rs::Playlist::MediaPlaylist(p) => p.segments[0].program_date_time,
+            _ => panic!("expected media playlist"),
+        };
+        let basic = read(mk("2026-11-14T12:14:46.338+0000"));
+        assert!(basic.is_some());
+        assert_eq!(basic, read(mk("2026-11-14T12:14:46.338+00:00")));
+        assert_eq!(read(mk("2026-11-14T13:14:46.338+0100")), basic);
+        assert!(read(mk("2026-11-14T12:14:46.338Z")).is_some());
     }
 
     #[test]

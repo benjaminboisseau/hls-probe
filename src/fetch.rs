@@ -36,9 +36,12 @@ pub fn parse_headers(extra: &[String]) -> Result<HeaderMap> {
     Ok(map)
 }
 
-pub fn client(extra_headers: &[String]) -> Result<Client> {
+/// `timeout_secs` bounds a whole request, body included: a large segment on
+/// a slow link needs more than a playlist does, hence the flag.
+pub fn client(extra_headers: &[String], timeout_secs: u64) -> Result<Client> {
     Client::builder()
-        .timeout(Duration::from_secs(10))
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(timeout_secs.max(1)))
         .default_headers(parse_headers(extra_headers)?)
         .build()
         .context("building HTTP client")
@@ -59,6 +62,22 @@ pub fn fetch(client: &Client, url: &Url) -> Result<Fetched> {
         elapsed: start.elapsed(),
         final_url,
     })
+}
+
+/// Open (and pool) a connection to `url`'s host before anything is timed
+/// against it. Segments often live on another host than the playlist; without
+/// this the first timed request would carry DNS + TCP + TLS and read as a
+/// slow origin. A HEAD on `/` touches no segment, so it warms no cache.
+pub fn warm_connection(client: &Client, url: &Url, already: &mut Vec<String>) {
+    let Some(host) = url.host_str() else { return };
+    let key = format!("{}://{}:{}", url.scheme(), host, url.port_or_known_default().unwrap_or(0));
+    if already.contains(&key) {
+        return;
+    }
+    if let Ok(root) = url.join("/") {
+        let _ = client.head(root.as_str()).send();
+    }
+    already.push(key);
 }
 
 /// Resolve a possibly relative playlist URI against the URL it was found in.

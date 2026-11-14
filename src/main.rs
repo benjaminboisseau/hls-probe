@@ -56,15 +56,20 @@ struct Args {
     /// Example: -H "Authorization: Bearer TOKEN" -H "X-Forwarded-For: 1.2.3.4"
     #[arg(short = 'H', long = "header", value_name = "NAME: VALUE")]
     headers: Vec<String>,
+
+    /// Give up on a request after this many seconds, body included. Raise it
+    /// to --measure large segments over a slow link
+    #[arg(short, long, default_value_t = 30, value_name = "SECONDS")]
+    timeout: u64,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
     let url = Url::parse(&args.url)?;
-    let client = fetch::client(&args.headers)?;
+    let client = fetch::client(&args.headers, args.timeout)?;
 
     let fetched = fetch::fetch(&client, &url)?;
-    let playlist = match m3u8_rs::parse_playlist_res(&fetched.bytes) {
+    let playlist = match crate::analyze::parse_playlist(&fetched.bytes) {
         Ok(p) => p,
         Err(e) => bail!("not a valid M3U8 playlist: {e}"),
     };
@@ -142,10 +147,10 @@ fn main() -> Result<()> {
                 if !variant_reports.is_empty() {
                     out["variant_reports"] = variant_reports
                         .iter()
-                        .map(|(uri, r, m, _)| {
+                        .map(|(uri, r, m, declared)| {
                             let mut v = media_json(uri, r);
                             if let Some(m) = m {
-                                v["measure"] = measure::report_json(m);
+                                v["measure"] = measure::report_json(m, Some(*declared));
                             }
                             v
                         })
@@ -163,7 +168,13 @@ fn main() -> Result<()> {
                     }
                 }
             }
-            exit_with(&report.issues);
+            // An error in any analyzed variant fails the run, not only one in
+            // the master playlist itself.
+            let mut all_issues = report.issues.clone();
+            for (_, r, _, _) in &variant_reports {
+                all_issues.extend(r.issues.iter().cloned());
+            }
+            exit_with(&all_issues);
         }
         Playlist::MediaPlaylist(_) => {
             run_media(&client, &fetched.final_url, &args)?;
@@ -174,7 +185,7 @@ fn main() -> Result<()> {
 
 fn fetch_media(client: &reqwest::blocking::Client, url: &Url) -> Result<m3u8_rs::MediaPlaylist> {
     let fetched = fetch::fetch(client, url)?;
-    match m3u8_rs::parse_playlist_res(&fetched.bytes) {
+    match crate::analyze::parse_playlist(&fetched.bytes) {
         Ok(Playlist::MediaPlaylist(p)) => Ok(p),
         Ok(Playlist::MasterPlaylist(_)) => bail!("{url} is a master playlist, expected media"),
         Err(e) => bail!("{url}: not a valid M3U8 playlist: {e}"),
@@ -212,7 +223,7 @@ fn run_media(client: &reqwest::blocking::Client, url: &Url, args: &Args) -> Resu
     if args.json {
         let mut out = media_json(url.as_str(), &report);
         if let Some(m) = &measured {
-            out["measure"] = measure::report_json(m);
+            out["measure"] = measure::report_json(m, None);
         }
         if let Some(stats) = &live_stats {
             out["live"] = live::stats_json(stats);
@@ -285,14 +296,8 @@ fn print_measure(m: &measure::MeasureReport, declared_bandwidth: Option<u64>) {
         );
     }
     if let Some(declared) = declared_bandwidth {
-        // RFC 8216 §4.3.4.2: BANDWIDTH is an upper bound of the peak segment
-        // bit rate; a sampled segment exceeding it is a real conformance issue.
-        if m.peak_bitrate_bps > declared as f64 {
-            println!(
-                "  [warning] peak segment bitrate {:.0} kbps exceeds declared BANDWIDTH {:.0} kbps",
-                m.peak_bitrate_bps / 1000.0,
-                declared as f64 / 1000.0,
-            );
+        if let Some(w) = measure::bandwidth_warning(m, declared) {
+            println!("  [warning] {w}");
         }
     }
     let c = &m.cacheability;
@@ -410,9 +415,19 @@ fn print_media(r: &analyze::MediaReport) {
 
 fn print_live(s: &live::LiveStats) {
     println!(
-        "live: {} refreshes over {:.0}s, {} new segment(s), {} stale refresh(es)",
-        s.refreshes, s.observed_seconds, s.new_segments, s.stale_refreshes,
+        "live: {} refreshes over {:.0}s, {} new segment(s), longest stall {:.1}s \
+         ({} of {} refreshes unchanged, at most {} in a row)",
+        s.refreshes,
+        s.observed_seconds,
+        s.new_segments,
+        s.longest_stall_seconds,
+        s.stale_refreshes,
+        s.refreshes,
+        s.max_consecutive_stale,
     );
+    for w in s.warnings() {
+        println!("  [warning] {w}");
+    }
     match (s.avg_latency, s.min_latency, s.max_latency) {
         (Some(avg), Some(min), Some(max)) => println!(
             "  edge lag: avg {avg:.1}s, min {min:.1}s, max {max:.1}s (PDT-based)"
